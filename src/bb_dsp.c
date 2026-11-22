@@ -313,7 +313,10 @@ static void choke_open(void) {
   for (int i = 0; i < NV; i++) if (VO[i].active && VO[i].isopen) VO[i].choke = 1;
 }
 
+static void chord_trigger(int deg, long gate, float vel);
+
 static void trig_voice(int tr, float vel) {
+  if (tr >= CH_AUDITION) { chord_trigger(tr - CH_AUDITION, (long)(0.9 * SR), vel); return; }
   Track *t = &tp[tr];
   if (t->vol <= 0) return;
   const Kit *P = &KITS[kit];
@@ -418,6 +421,8 @@ static float voice_proc(Voice *v) {
   return out;
 }
 
+#include "bb_chord.h"
+
 /* ------------------------------------------------------------------ */
 /* Trigger-Warteschlange (UI -> Audio)                                  */
 /* ------------------------------------------------------------------ */
@@ -481,7 +486,12 @@ void dsp_init(int sr) {
   SR = sr > 8000 ? sr : 44100;
   kit_init_all();
   memset(VO, 0, sizeof VO);
+  memset(CV, 0, sizeof CV); s_cg = 0.0f;
+  rhead = rtail = 0; req_play = -1;
   memset(pend, 0, sizeof pend);
+  free(dlyBuf);
+  for (int i = 0; i < NC; i++) { free(combB[i]); combB[i] = NULL; }
+  for (int i = 0; i < NAP; i++) { free(apB[i]); apB[i] = NULL; }
   dlyN = 2 * SR + 8; dlyBuf = (float *)calloc((size_t)dlyN, sizeof(float)); dlyW = 0;
   float sc = (float)SR / 44100.0f;
   for (int i = 0; i < NC; i++) { combL[i] = (int)(combL44[i] * sc); combB[i] = (float *)calloc((size_t)combL[i], sizeof(float)); combP[i] = 0; combLPs[i] = 0; }
@@ -520,6 +530,7 @@ static void update_params(void) {
   if (dt > 1.9f) dt = 1.9f;
   s_dt = smooth(s_dt, dt, c50);
   if (f[6] != lastRoom) set_room(f[6]);
+  s_cg = smooth(s_cg, powf((float)ch_vol / 10.0f, 1.4f), c20);
 }
 
 static void fire_step(void) {
@@ -527,6 +538,10 @@ static void fire_step(void) {
   for (int r = 0; r < NT; r++) {
     int s = pats[curPat][r][step];
     if (s && !tp[r].mute) trig_voice(r, s == 2 ? 1.0f : 0.62f);
+  }
+  if (ch_on && cps[curPat][step]) {
+    double sl = 60.0 / (double)bpm / 4.0 * (double)SR;
+    chord_trigger(cps[curPat][step], (long)((double)CH_LENS[ch_len] * sl * 0.97), 1.0f);
   }
   play_step = step;
   step = (step + 1) % NS;
@@ -560,6 +575,7 @@ void bb_audio_render(int16_t *out, int frames) {
     float m = 0.0f;
     for (int vi = 0; vi < NV; vi++) if (VO[vi].active) m += voice_proc(&VO[vi]);
     m *= 0.85f;
+    { float cm = 0.0f; for (int ci = 0; ci < NCV; ci++) if (CV[ci].active) cm += cv_proc(&CV[ci]); m += cm * s_cg; }
 
     const int *f = fxOn ? fx : FXD;
 
