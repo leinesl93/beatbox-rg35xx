@@ -43,6 +43,22 @@ extern const int FXD[NFX], FXMAX[NFX];
 extern const char *const TRACK_NAMES[NT];
 extern const uint32_t TRACK_COLORS[NT];
 
+/* Akkorde */
+#define NCI 8              /* Akkord-Klaenge */
+#define NCP 20             /* Akkord-Vorlagen (2 pro Genre) */
+#define CH_AUDITION 100    /* dsp_trigger(CH_AUDITION + Stufe) spielt einen Akkord zur Probe */
+typedef struct { const char *name; int inst, key, minor, sev, len, oct; const char *steps; } ChPreset;
+extern const ChPreset CHP[NCP];
+extern const char *const CH_INST_NAMES[NCI];
+extern const char *const NOTE_NAMES[12];
+extern const int CH_LENS[5];
+extern uint8_t cps[NP][NS];                 /* Akkord-Stufe je Step (0 = keiner, 1..7) */
+extern int ch_row, ch_cur;                     /* UI: Akkord-Seite */
+extern int ch_on, ch_inst, ch_key, ch_minor, ch_sev, ch_len, ch_oct, ch_vol, ch_preset;
+void dsp_chord_notes(int deg, int out[4]);
+void dsp_chord_name(int deg, char *root, char *qual);   /* z. B. "A" und "MIN7" */
+void dsp_chord_load(int preset, int pat);               /* Vorlage in Pattern laden */
+
 void dsp_init(int sr);
 void dsp_trigger(int track, float vel, float delay_sec);  /* aus dem UI-Thread */
 void dsp_request_play(int on);                            /* 1 = Start, 0 = Stop */
