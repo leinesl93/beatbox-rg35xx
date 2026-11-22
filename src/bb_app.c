@@ -7,7 +7,7 @@
 
 void dsp_init(int sr);
 
-enum { M_GRID, M_FX, M_LEARN };
+enum { M_GRID, M_KIT, M_FX, M_LEARN, M_TEST };
 
 static int mode = M_GRID;
 static int cur_r = 0, cur_c = 0, fx_sel = 0;
@@ -21,12 +21,18 @@ static char datadir[512] = ".";
 static int kmap[PAD_COUNT];
 static int learn_idx = 0;
 static uint32_t learn_ignore_until = 0;
+static int sel_used = 0;                 /* SELECT wurde als Kombination benutzt */
+static char lastraw[48] = "-";            /* letzte Roh-Taste (Diagnose) */
+static char learn_msg[48] = "";
+static char toast[40] = ""; static int toast_ms = 0;
+static int rawdown[16], nraw = 0; static uint32_t last_raw_ms = 0;
 static const char *const PAD_LABEL[PAD_COUNT] = {"HOCH", "RUNTER", "LINKS", "RECHTS", "A", "B", "X", "Y", "L", "R", "SELECT", "START", "MENU"};
 
 /* ------------------------------------------------------------------ */
 /* Speichern / Laden                                                    */
 /* ------------------------------------------------------------------ */
 #define MAGIC 0xBEA7B0C2u
+#define MAGIC_MAP 0xBEA7B0C4u   /* neue Kennung: alte bbmap.cfg wird ignoriert */
 
 static void path_of(char *dst, size_t n, const char *name) {
   snprintf(dst, n, "%s/%s", datadir, name);
@@ -36,7 +42,7 @@ static int load_map(void) {
   char p[640]; path_of(p, sizeof p, "bbmap.cfg");
   FILE *f = fopen(p, "rb"); if (!f) return 0;
   unsigned magic = 0; int tmp[PAD_COUNT];
-  int ok = fread(&magic, sizeof magic, 1, f) == 1 && magic == MAGIC && fread(tmp, sizeof tmp, 1, f) == 1;
+  int ok = fread(&magic, sizeof magic, 1, f) == 1 && magic == MAGIC_MAP && fread(tmp, sizeof tmp, 1, f) == 1;
   fclose(f);
   if (ok) memcpy(kmap, tmp, sizeof kmap);
   return ok;
@@ -44,7 +50,7 @@ static int load_map(void) {
 static void save_map(void) {
   char p[640]; path_of(p, sizeof p, "bbmap.cfg");
   FILE *f = fopen(p, "wb"); if (!f) return;
-  unsigned magic = MAGIC;
+  unsigned magic = MAGIC_MAP;
   fwrite(&magic, sizeof magic, 1, f); fwrite(kmap, sizeof kmap, 1, f);
   fclose(f);
 }
@@ -103,7 +109,7 @@ static void set_kit(int k, int audition) {
 void bb_init(int sample_rate, const char *dir) {
   if (dir && *dir) snprintf(datadir, sizeof datadir, "%s", dir);
   dsp_init(sample_rate);
-  cur_r = cur_c = fx_sel = 0; quit_req = dirty = autosave_ms = 0;
+  cur_r = cur_c = fx_sel = 0; learn_msg[0] = 0; quit_req = dirty = autosave_ms = 0;
   memset(held, 0, sizeof held); memset(hold_ms, 0, sizeof hold_ms);
   playing = 0; play_step = -1; fxOn = 1; memcpy(fx, FXD, sizeof fx);
   memset(pats, 0, sizeof pats);
@@ -112,6 +118,7 @@ void bb_init(int sample_rate, const char *dir) {
   load_save();
   for (int i = 0; i < PAD_COUNT; i++) kmap[i] = -1;
   if (load_map()) mode = M_GRID; else { mode = M_LEARN; learn_idx = 0; }
+  sel_used = 0; toast_ms = 0; nraw = 0;
 }
 
 void bb_test_identity_map(void) {
@@ -120,14 +127,34 @@ void bb_test_identity_map(void) {
 }
 
 int bb_wants_quit(void) { return quit_req; }
+int bb_test_mode(void) { return mode; }
 
 /* ------------------------------------------------------------------ */
 /* Eingabe                                                              */
 /* ------------------------------------------------------------------ */
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+static void say(const char *m) { snprintf(toast, sizeof toast, "%s", m); toast_ms = 1800; }
+
+static void audition(void) {
+  if (playing) return;
+  dsp_trigger(0, 1.0f, 0.0f); dsp_trigger(3, 0.8f, 0.18f); dsp_trigger(1, 0.9f, 0.36f); dsp_trigger(3, 0.8f, 0.54f);
+}
+
+static void start_learn(void) {
+  mode = M_LEARN; learn_idx = 0; learn_msg[0] = 0;
+  for (int i = 0; i < PAD_COUNT; i++) kmap[i] = -1;
+  memset(held, 0, sizeof held); nraw = 0;
+}
+
 static void do_dir(int b) {
   int dx = (b == PAD_RIGHT) - (b == PAD_LEFT), dy = (b == PAD_DOWN) - (b == PAD_UP);
+  if (mode == M_LEARN || mode == M_TEST) return;
+  if (mode == M_KIT) {
+    int d = dy ? dy : dx;
+    if (d) { kit = (kit + d + NKITS) % NKITS; dirty = 1; audition(); }
+    return;
+  }
   if (mode == M_FX) {
     if (dy) fx_sel = (fx_sel + dy + NFX) % NFX;
     if (dx) { fx[fx_sel] = clampi(fx[fx_sel] + dx, 0, FXMAX[fx_sel]); dirty = 1; }
@@ -149,39 +176,57 @@ static void do_dir(int b) {
   }
 }
 
+static void next_page(void) {
+  mode = (mode == M_GRID) ? M_KIT : (mode == M_KIT ? M_FX : M_GRID);
+}
+
 static void do_press(int b) {
+  if (mode == M_TEST) {
+    if (b == PAD_START) { save_map(); mode = M_GRID; say("TASTEN GESPEICHERT"); }
+    else if (b == PAD_SELECT) start_learn();
+    else if (b == PAD_MENU) quit_req = 1;
+    return;
+  }
+  if (b != PAD_SELECT && held[PAD_SELECT]) sel_used = 1;
   switch (b) {
     case PAD_UP: case PAD_DOWN: case PAD_LEFT: case PAD_RIGHT: do_dir(b); break;
     case PAD_A:
       if (mode == M_FX) { fxOn = !fxOn; dirty = 1; break; }
-      if (held[PAD_SELECT]) { load_beat(kit, curPat); dirty = 1; break; }
+      if (mode == M_KIT) {
+        load_beat(kit, curPat); bpm = KITS[kit].bpm; swing = KITS[kit].sw; dirty = 1;
+        { char m[40]; snprintf(m, sizeof m, "%s BEAT GELADEN (PATTERN %c)", KITS[kit].name, 'A' + curPat); say(m); }
+        break;
+      }
+      if (held[PAD_SELECT]) { load_beat(kit, curPat); bpm = KITS[kit].bpm; swing = KITS[kit].sw; dirty = 1; say("BEAT GELADEN"); break; }
       { uint8_t *c = &pats[curPat][cur_r][cur_c]; *c = (uint8_t)((*c + 1) % 3); dirty = 1;
         if (*c) dsp_trigger(cur_r, *c == 2 ? 1.0f : 0.62f, 0); }
       break;
-    case PAD_B: break;
+    case PAD_B:
+      if (mode == M_KIT || mode == M_FX) mode = M_GRID;
+      break;
     case PAD_X:
       if (mode == M_GRID) { tp[cur_r].mute = !tp[cur_r].mute; dirty = 1; }
       break;
     case PAD_Y:
       if (mode == M_FX) { for (int i = 0; i < NFX; i++) fx[i] = FXD[i]; dirty = 1; break; }
+      if (mode != M_GRID) break;
       if (held[PAD_SELECT]) clear_pattern(curPat); else memset(pats[curPat][cur_r], 0, NS);
       dirty = 1;
       break;
     case PAD_L: case PAD_R: {
       int d = (b == PAD_R) ? 1 : -1;
-      if (held[PAD_SELECT]) { set_kit(kit + d, 1); break; }
+      if (held[PAD_SELECT] && mode == M_GRID) { set_kit(kit + d, 1); break; }
       int np = ((nextPat >= 0 && playing ? nextPat : curPat) + d + NP) % NP;
       if (playing) nextPat = np; else curPat = np;
       dirty = 1;
     } break;
     case PAD_START:
-      if (held[PAD_SELECT]) { mode = (mode == M_FX) ? M_GRID : M_FX; break; }
+      if (held[PAD_SELECT] && mode != M_KIT) { mode = (mode == M_FX) ? M_GRID : M_FX; break; }
       dsp_request_play(playing ? 0 : 1);
       break;
-    case PAD_SELECT: break;
+    case PAD_SELECT: sel_used = 0; break;
     case PAD_MENU:
-      if (held[PAD_SELECT]) { mode = M_LEARN; learn_idx = 0; for (int i = 0; i < PAD_COUNT; i++) kmap[i] = -1; }
-      else quit_req = 1;
+      if (held[PAD_SELECT]) start_learn(); else quit_req = 1;
       break;
   }
 }
@@ -193,19 +238,36 @@ void bb_button(int b, int down) {
     if (held[b]) return;
     held[b] = 1; hold_ms[b] = 0;
     do_press(b);
-  } else held[b] = 0;
+  } else {
+    int was = held[b];
+    held[b] = 0;
+    if (was && b == PAD_SELECT && !sel_used && mode != M_TEST) next_page();   /* kurzes Antippen: naechste Seite */
+  }
+}
+
+static void describe_raw(int code, char *dst, size_t n) {
+  if (code >= 0x50000) snprintf(dst, n, "D-PAD ACHSE %d", code - 0x50000);
+  else if (code >= 0x40000) snprintf(dst, n, "EVDEV %d TASTE %d", (code - 0x40000) >> 12, (code - 0x40000) & 0xFFF);
+  else snprintf(dst, n, "SDL TASTE %d", code - 0x10000);
 }
 
 int bb_raw_key(int code, int down) {
+  /* gedrueckt gehaltene Roh-Tasten verfolgen (zwei Quellen melden oft dieselbe Taste) */
+  if (tms - last_raw_ms > 1500) nraw = 0;
+  last_raw_ms = tms;
+  int was_empty = (nraw == 0), idx = -1;
+  for (int i = 0; i < nraw; i++) if (rawdown[i] == code) idx = i;
+  if (down) { if (idx < 0 && nraw < 16) rawdown[nraw++] = code; describe_raw(code, lastraw, sizeof lastraw); }
+  else if (idx >= 0) rawdown[idx] = rawdown[--nraw];
+
   if (mode == M_LEARN) {
-    if (!down || tms < learn_ignore_until) return 1;
-    for (int i = 0; i < learn_idx; i++) if (kmap[i] == code) return 1;
+    if (!down || !was_empty || idx >= 0 || tms < learn_ignore_until) return 1;
+    for (int i = 0; i < learn_idx; i++)
+      if (kmap[i] == code) { snprintf(learn_msg, sizeof learn_msg, "SCHON BELEGT: %s", PAD_LABEL[i]); return 1; }
+    learn_msg[0] = 0;
     kmap[learn_idx++] = code;
-    learn_ignore_until = tms + 500;
-    if (learn_idx >= PAD_COUNT) {
-      save_map(); mode = M_GRID;
-      memset(held, 0, sizeof held);
-    }
+    learn_ignore_until = tms + 400;
+    if (learn_idx >= PAD_COUNT) { mode = M_TEST; memset(held, 0, sizeof held); }
     return 1;
   }
   for (int i = 0; i < PAD_COUNT; i++)
@@ -215,7 +277,8 @@ int bb_raw_key(int code, int down) {
 
 void bb_tick(int dt) {
   tms += (uint32_t)dt;
-  if (mode != M_LEARN) {
+  if (toast_ms > 0) toast_ms -= dt;
+  if (mode != M_LEARN && mode != M_TEST) {
     for (int b = PAD_UP; b <= PAD_RIGHT; b++) {
       if (!held[b]) continue;
       hold_ms[b] += dt;
@@ -272,23 +335,71 @@ static void textc(int cx, int y, const char *s, int sc, uint16_t c) { text(cx - 
 #define COL_DIM 0x7d8596
 #define COL_ACC 0xffb347
 
-static void draw_learn(void) {
-  rect(0, 0, BB_W, BB_HGT, rgb(COL_BG));
-  textc(320, 30, "TASTEN EINLERNEN", 3, rgb(COL_ACC));
-  textc(320, 80, "EINMALIGE EINRICHTUNG", 2, rgb(COL_DIM));
-  if (learn_idx < PAD_COUNT) {
-    textc(320, 150, "DRUECKE JETZT DIE TASTE:", 2, rgb(COL_TXT));
-    textc(320, 200, PAD_LABEL[learn_idx], 6, rgb(0x7bed9f));
-    char buf[32]; snprintf(buf, sizeof buf, "%d VON %d", learn_idx + 1, PAD_COUNT);
-    textc(320, 290, buf, 2, rgb(COL_DIM));
-  }
+static void draw_pad_boxes(int highlight_held) {
   for (int i = 0; i < PAD_COUNT; i++) {
-    int x = 40 + (i % 7) * 85, y = 350 + (i / 7) * 40;
-    uint16_t c = i < learn_idx ? rgb(0x7bed9f) : (i == learn_idx ? rgb(COL_ACC) : rgb(0x3a4152));
-    rect(x, y, 76, 30, shade(0x181c25, 100)); frame(x, y, 76, 30, c);
+    int x = 40 + (i % 7) * 85, y = 330 + (i / 7) * 40;
+    uint16_t c; uint16_t bg = rgb(COL_PANEL);
+    if (highlight_held) { c = held[i] ? rgb(COL_BG) : rgb(0x7bed9f); if (held[i]) bg = rgb(0x7bed9f); }
+    else c = i < learn_idx ? rgb(0x7bed9f) : (i == learn_idx ? rgb(COL_ACC) : rgb(0x3a4152));
+    rect(x, y, 76, 30, bg); frame(x, y, 76, 30, c);
     textc(x + 38, y + 11, PAD_LABEL[i], 1, c);
   }
-  textc(320, 450, "FALSCHE TASTE? EINFACH NEU STARTEN UND BBMAP.CFG LOESCHEN", 1, rgb(COL_DIM));
+}
+
+static void draw_learn(void) {
+  rect(0, 0, BB_W, BB_HGT, rgb(COL_BG));
+  textc(320, 24, "TASTEN EINLERNEN", 3, rgb(COL_ACC));
+  textc(320, 70, "EINMALIGE EINRICHTUNG", 2, rgb(COL_DIM));
+  if (learn_idx < PAD_COUNT) {
+    textc(320, 130, "DRUECKE JETZT DIE TASTE:", 2, rgb(COL_TXT));
+    textc(320, 175, PAD_LABEL[learn_idx], 6, rgb(0x7bed9f));
+    char buf[32]; snprintf(buf, sizeof buf, "%d VON %d", learn_idx + 1, PAD_COUNT);
+    textc(320, 250, buf, 2, rgb(COL_DIM));
+  }
+  if (learn_msg[0]) textc(320, 285, learn_msg, 2, rgb(0xff5a5f));
+  draw_pad_boxes(0);
+  textc(320, 420, "TASTE LOSLASSEN, BEVOR DU DIE NAECHSTE DRUECKST", 1, rgb(COL_DIM));
+  { char b2[80]; snprintf(b2, sizeof b2, "LETZTES SIGNAL: %s", lastraw); textc(320, 440, b2, 1, rgb(COL_DIM)); }
+}
+
+static void draw_test(void) {
+  rect(0, 0, BB_W, BB_HGT, rgb(COL_BG));
+  textc(320, 24, "TASTENTEST", 3, rgb(COL_ACC));
+  textc(320, 80, "DRUECKE ALLE TASTEN: DAS FELD LEUCHTET AUF", 2, rgb(COL_TXT));
+  textc(320, 130, "LEUCHTET DIE RICHTIGE TASTE?", 2, rgb(COL_DIM));
+  draw_pad_boxes(1);
+  textc(320, 250, "ALLES RICHTIG: START = SPEICHERN", 2, rgb(0x7bed9f));
+  textc(320, 285, "FALSCH: SELECT = NEU EINLERNEN", 2, rgb(0xff5a5f));
+  { char b2[80]; snprintf(b2, sizeof b2, "LETZTES SIGNAL: %s", lastraw); textc(320, 440, b2, 1, rgb(COL_DIM)); }
+}
+
+static void draw_toast(void) {
+  if (toast_ms <= 0) return;
+  int w = text_w(toast, 2) + 24;
+  rect(320 - w / 2, 352, w, 30, rgb(0x1f6f3f)); frame(320 - w / 2, 352, w, 30, rgb(0x7bed9f));
+  textc(320, 360, toast, 2, rgb(COL_TXT));
+}
+
+static void draw_kit(void) {
+  rect(0, 0, BB_W, BB_HGT, rgb(COL_BG));
+  rect(0, 0, BB_W, 44, rgb(COL_PANEL));
+  text(12, 8, "KIT / GENRE", 3, rgb(COL_ACC));
+  { char b[40]; snprintf(b, sizeof b, "PATTERN %c", 'A' + curPat); text(470, 14, b, 2, rgb(COL_TXT)); }
+  for (int i = 0; i < NKITS; i++) {
+    int y = 52 + i * 33, sel = (i == kit);
+    rect(10, y, 620, 30, sel ? rgb(0x232938) : rgb(COL_PANEL));
+    if (sel) frame(10, y, 620, 30, rgb(COL_ACC));
+    text(24, y + 8, KITS[i].name, 2, sel ? rgb(COL_ACC) : rgb(COL_DIM));
+    char b[32]; snprintf(b, sizeof b, "%d BPM", KITS[i].bpm);
+    text(420, y + 8, b, 2, sel ? rgb(COL_TXT) : rgb(COL_DIM));
+    if (sel) text(560, y + 8, "<<", 2, rgb(COL_ACC));
+  }
+  rect(0, 390, BB_W, 90, rgb(COL_PANEL));
+  text(10, 398, "HOCH/RUNTER: KIT WAEHLEN (KLANG SOFORT)", 1, rgb(COL_TXT));
+  text(10, 412, "A: BEAT DES KITS IN DAS AKTUELLE PATTERN LADEN", 1, rgb(0x7bed9f));
+  text(10, 426, "L/R: PATTERN WECHSELN   START: PLAY/STOP   B: ZURUECK", 1, rgb(COL_DIM));
+  text(10, 440, "SELECT ANTIPPEN: WEITER ZU EFFEKTEN", 1, rgb(COL_DIM));
+  draw_toast();
 }
 
 static void draw_fx(uint32_t now) {
@@ -320,7 +431,7 @@ static void draw_fx(uint32_t now) {
   }
   textc(320, 410, "HOCH/RUNTER: WAHL   LINKS/RECHTS: WERT", 1, rgb(COL_DIM));
   textc(320, 424, "A: AN/AUS   Y: ZURUECKSETZEN   START: PLAY/STOP", 1, rgb(COL_DIM));
-  textc(320, 438, "SELECT+START: ZURUECK ZUM RASTER", 1, rgb(COL_DIM));
+  textc(320, 438, "B ODER SELECT ANTIPPEN: ZURUECK ZUM RASTER", 1, rgb(COL_DIM));
   (void)now;
 }
 
@@ -383,13 +494,15 @@ static void draw_grid(uint32_t now) {
   if (!fxOn) text(560, 402, "FX AUS", 1, rgb(COL_DIM));
   text(10, 424, "A: STEP AN/AKZENT/AUS   X: MUTE   Y: ZEILE LEEREN   L/R: PATTERN", 1, rgb(COL_DIM));
   text(10, 438, "B+PFEILE: VOL (HOCH/RUNTER) TUNE (LINKS/RECHTS)   START: PLAY/STOP", 1, rgb(COL_DIM));
-  text(10, 452, "SELECT+HOCH/RUNTER: BPM  +LINKS/RECHTS: SWING  +L/R: KIT  +A: BEAT LADEN", 1, rgb(COL_DIM));
-  text(10, 466, "SELECT+Y: PATTERN LEEREN  SELECT+START: EFFEKTE  MENU: SPEICHERN+ENDE", 1, rgb(COL_DIM));
+  text(10, 452, "SELECT ANTIPPEN: KIT-SEITE (GENRE+BEAT), DANACH EFFEKTE", 1, rgb(0x7bed9f));
+  text(10, 466, "SELECT+PFEILE: BPM/SWING  SELECT+L/R: KIT  SELECT+Y: PATTERN LEEREN  MENU: ENDE", 1, rgb(COL_DIM));
 }
 
 void bb_draw(uint16_t *fb, uint32_t now) {
   FB = fb;
   if (mode == M_LEARN) draw_learn();
-  else if (mode == M_FX) draw_fx(now);
-  else draw_grid(now);
+  else if (mode == M_TEST) draw_test();
+  else if (mode == M_KIT) draw_kit();
+  else if (mode == M_FX) { draw_fx(now); draw_toast(); }
+  else { draw_grid(now); draw_toast(); }
 }
